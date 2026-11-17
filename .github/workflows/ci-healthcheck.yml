@@ -1,0 +1,44 @@
+name: Runner Environment Healthcheck
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+jobs:
+  diagnostics:
+    name: System & Network Diagnostics
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Inspect Hardware & Kernel Specs
+        run: |
+          echo "=== Kernel & OS ==="
+          uname -a
+          lsb_release -a 2>/dev/null || cat /etc/os-release
+
+          echo "=== CPU & Memory ==="
+          lscpu | grep -E "Model name|CPU\(s\)|Thread"
+          free -h
+
+          echo "=== Disk Allocations ==="
+          df -h / /mnt
+
+      - name: Check Core CLI Tooling
+        run: |
+          for cmd in git curl jq openssl rsync tar zstd python3; do
+            if command -v "$cmd" >/dev/null 2>&1; then
+              echo "✅ $cmd: $(command -v "$cmd")"
+            else
+              echo "⚠️ $cmd: missing"
+            fi
+          done
+
+      - name: Network Latency & Throughput Check
+        run: |
+          echo "Testing connection latency to GitHub API..."
+          curl -o /dev/null -s -w "DNS: %{time_namelookup}s | Connect: %{time_connect}s | Total: %{time_total}s\n" https://api.github.com

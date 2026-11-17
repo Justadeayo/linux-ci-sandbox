@@ -1,0 +1,28 @@
+name: System Performance Benchmark
+
+on:
+  workflow_dispatch:
+
+jobs:
+  benchmark:
+    name: CPU & Disk I/O Benchmark
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run CPU Compute Benchmark (sysbench)
+        run: |
+          sudo apt-get update && sudo apt-get install -y sysbench
+          echo "=== CPU Prime Number Calculation Test (4 threads) ==="
+          sysbench cpu --cpu-max-prime=20000 --threads=4 run
+
+      - name: Run Disk I/O Throughput Test
+        run: |
+          echo "=== Writing 2GB Test File ==="
+          sysbench fileio --file-total-size=2G prepare
+          echo "=== Running Sequential/Random Read/Write Test ==="
+          sysbench fileio --file-total-size=2G --file-test-mode=rndrw run
+          sysbench fileio --file-total-size=2G cleanup
