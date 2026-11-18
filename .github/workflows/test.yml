@@ -1,0 +1,144 @@
+name: Build Preflight (Test)
+
+on:
+  workflow_dispatch:
+    inputs:
+      MANIFEST_URL:
+        description: 'Manifest repo URL'
+        required: true
+        default: 'https://github.com/DerpFest-AOSP/android_manifest'
+      MANIFEST_BRANCH:
+        description: 'Manifest branch'
+        required: true
+        default: '17'
+      DEVICE:
+        description: 'Device codename'
+        required: true
+        default: 'violet'
+      BUILD_TYPE:
+        description: 'Build type (user, userdebug, eng)'
+        required: true
+        default: 'user'
+        type: choice
+        options:
+          - user
+          - userdebug
+          - eng
+
+jobs:
+  preflight:
+    name: Preflight ${{ inputs.DEVICE }} (${{ inputs.MANIFEST_BRANCH }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Show disk and memory
+        run: |
+          df -h
+          free -h
+          nproc
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq git python3 curl jq openssl
+
+      - name: Fetch repo tool
+        run: |
+          mkdir -p ~/.bin
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o ~/.bin/repo
+          chmod a+rx ~/.bin/repo
+          ~/.bin/repo --version
+          # Validate that the script is Python and runs
+          python3 ~/.bin/repo --help >/dev/null
+          echo "repo tool OK"
+
+      - name: Validate manifest is reachable and branch exists
+        run: |
+          set -e
+          git ls-remote --exit-code --heads "${{ inputs.MANIFEST_URL }}" "refs/heads/${{ inputs.MANIFEST_BRANCH }}" \
+            || git ls-remote --exit-code --tags "${{ inputs.MANIFEST_URL }}" "refs/tags/${{ inputs.MANIFEST_BRANCH }}" \
+            || { echo "::error::Branch or tag '${{ inputs.MANIFEST_BRANCH }}' not found in ${{ inputs.MANIFEST_URL }}"; exit 1; }
+          echo "Manifest branch found."
+
+      - name: Validate manifest XML parses
+        run: |
+          set -e
+          tmp=$(mktemp -d)
+          git clone --depth=1 -b "${{ inputs.MANIFEST_BRANCH }}" "${{ inputs.MANIFEST_URL }}" "$tmp/manifest"
+          # Every XML file must be well-formed
+          python3 - "$tmp/manifest" <<'PY'
+          import sys, pathlib, xml.etree.ElementTree as ET
+          root = pathlib.Path(sys.argv[1])
+          files = list(root.rglob("*.xml"))
+          if not files:
+              sys.exit("No XML files found in manifest repo")
+          bad = 0
+          for f in files:
+              try:
+                  ET.parse(f)
+              except ET.ParseError as e:
+                  print(f"::error file={f}::{e}")
+                  bad += 1
+          print(f"Parsed {len(files)} XML files, {bad} invalid.")
+          sys.exit(1 if bad else 0)
+          PY
+
+      - name: Validate lunch target exists in device tree (dry check)
+        run: |
+          set -e
+          tmp=$(mktemp -d)
+          git clone --depth=1 -b "${{ inputs.MANIFEST_BRANCH }}" "${{ inputs.MANIFEST_URL }}" "$tmp/manifest"
+          # Look for a product makefile that names the device.
+          # Full validation needs the device tree, which is fetched later.
+          if grep -rIl --include='*.mk' "${{ inputs.DEVICE }}" "$tmp/manifest" >/dev/null 2>&1; then
+            echo "Manifest references '${{ inputs.DEVICE }}'."
+          else
+            echo "::warning::'${{ inputs.DEVICE }}' not referenced in the manifest repo itself. It may be pulled in via local manifests or device repos. Confirm before a full build."
+          fi
+
+      - name: Validate signing key secrets are set
+        env:
+          KEY_PASS: ${{ secrets.KEY_PASS }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SF_SSH_KEY: ${{ secrets.SF_SSH_KEY }}
+        run: |
+          for v in KEY_PASS TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID SF_SSH_KEY; do
+            if [ -n "${!v}" ]; then
+              echo "$v: set"
+            else
+              echo "::warning::$v is not set"
+            fi
+          done
+
+      - name: Validate key bundle decrypts (no secrets printed)
+        env:
+          KEY_PASS: ${{ secrets.KEY_PASS }}
+          ASSET_URL: "https://gist.githubusercontent.com/Justadeayo/d6543288b98712e5944bb6dec36d2091/raw/4c08760bc151daccc24db8f6a576c43d02a1fa36/keys.json"
+          JSON_KEY: ${{ inputs.DEVICE }}
+        run: |
+          if [ -z "${KEY_PASS}" ] || [ -z "${ASSET_URL}" ]; then
+            echo "::notice::Skipping key check (KEY_PASS or ASSET_URL missing)."
+            exit 0
+          fi
+          tmp=$(mktemp)
+          curl -fsSL "${ASSET_URL}" | jq -er --arg k "${JSON_KEY}" '.[$k] // empty' | base64 -d > "$tmp"
+          if KEY_PASS="${KEY_PASS}" openssl enc -d -aes-256-cbc -pbkdf2 -pass env:KEY_PASS -in "$tmp" | tar -t >/dev/null; then
+            echo "Key bundle decrypts and is a valid tar archive."
+          else
+            echo "::error::Key bundle failed to decrypt or is not a tar archive."
+            exit 1
+          fi
+          rm -f "$tmp"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Preflight complete"
+            echo "- Manifest: ${{ inputs.MANIFEST_URL }} @ ${{ inputs.MANIFEST_BRANCH }}"
+            echo "- Device: ${{ inputs.DEVICE }}"
+            echo "- Build type: ${{ inputs.BUILD_TYPE }}"
+            echo ""
+            echo "No source was synced and nothing was compiled."
+          } >> "$GITHUB_STEP_SUMMARY"
